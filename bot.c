@@ -38,10 +38,14 @@
 #define kVK_Return    0x24
 #define kVK_Tab       0x30
 #define kVK_Escape    0x35
+#define kVK_PageUp    0x74
+#define kVK_PageDown  0x79
+#define kVK_End       0x77
 
 #define MOD_CTRL    (1<<0)
 #define MOD_ALT     (1<<1)
 #define MOD_CMD     (1<<2)
+#define MOD_SHIFT   (1<<3)
 
 /* Known terminal application names. */
 static const char *TerminalApps[] = {
@@ -75,6 +79,7 @@ static CGWindowID ConnectedWid = 0;   /* Window ID of connected window. */
 static pid_t ConnectedPid = 0;        /* PID of connected window. */
 static char ConnectedOwner[128];      /* Owner name for display. */
 static char ConnectedTitle[256];      /* Title for display. */
+static int ArmedMods = 0;            /* Modifier keys armed via buttons. */
 
 /* ============================================================================
  * TOTP Authentication
@@ -598,6 +603,7 @@ void send_key(pid_t pid, CGKeyCode keycode, UniChar ch, int mods) {
     if (mods & MOD_CTRL) flags |= kCGEventFlagMaskControl;
     if (mods & MOD_ALT)  flags |= kCGEventFlagMaskAlternate;
     if (mods & MOD_CMD)  flags |= kCGEventFlagMaskCommand;
+    if (mods & MOD_SHIFT) flags |= kCGEventFlagMaskShift;
 
     if (flags) {
         CGEventSetFlags(down, flags);
@@ -716,6 +722,86 @@ int send_keys(const char *text) {
  * Bot Command Handlers
  * ========================================================================= */
 
+/* ============================================================================
+ * Inline Keyboard Builders
+ * ========================================================================= */
+
+/* Helper: add a button to a cJSON row array. */
+static void kb_add_button(cJSON *row, const char *text, const char *data) {
+    cJSON *btn = cJSON_CreateObject();
+    cJSON_AddStringToObject(btn, "text", text);
+    cJSON_AddStringToObject(btn, "callback_data", data);
+    cJSON_AddItemToArray(row, btn);
+}
+
+/* Helper: serialize a cJSON keyboard array to JSON string. */
+static sds kb_to_json(cJSON *kb) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddItemToObject(root, "inline_keyboard", kb);
+    char *json = cJSON_PrintUnformatted(root);
+    sds result = sdsnew(json);
+    free(json);
+    cJSON_Delete(root);
+    return result;
+}
+
+/* Build keyboard for connected state: modifier buttons + refresh/list. */
+sds build_connected_keyboard(void) {
+    cJSON *kb = cJSON_CreateArray();
+
+    /* Row 1: modifier keys. */
+    cJSON *row1 = cJSON_CreateArray();
+    kb_add_button(row1, (ArmedMods & MOD_CTRL) ? "\xe2\x9c\x93 Ctrl" : "Ctrl", "ctrl");
+    kb_add_button(row1, (ArmedMods & MOD_ALT) ? "\xe2\x9c\x93 Alt" : "Alt", "alt");
+    kb_add_button(row1, (ArmedMods & MOD_CMD) ? "\xe2\x9c\x93 Cmd" : "Cmd", "cmd");
+    kb_add_button(row1, "ESC", "esc");
+    kb_add_button(row1, "Enter", "enter");
+    cJSON_AddItemToArray(kb, row1);
+
+    /* Row 2: scroll. */
+    cJSON *row2 = cJSON_CreateArray();
+    kb_add_button(row2, "\xe2\xac\x86 Up", "scrollup");
+    kb_add_button(row2, "\xe2\xac\x87 Down", "scrolldn");
+    kb_add_button(row2, "\xe2\x8f\xac Bottom", "scrollbot");
+    cJSON_AddItemToArray(kb, row2);
+
+    /* Row 3: actions. */
+    cJSON *row3 = cJSON_CreateArray();
+    kb_add_button(row3, "\xf0\x9f\x94\x84 Refresh", "refresh");
+    kb_add_button(row3, "\xf0\x9f\x93\x8b List", "list");
+    cJSON_AddItemToArray(kb, row3);
+
+    return kb_to_json(kb);
+}
+
+/* Build keyboard for window listing: one button per window. */
+sds build_window_list_keyboard(void) {
+    if (WindowCount == 0) return NULL;
+
+    cJSON *kb = cJSON_CreateArray();
+    for (int i = 0; i < WindowCount; i++) {
+        WinInfo *w = &WindowList[i];
+        cJSON *row = cJSON_CreateArray();
+
+        char text[64];
+        if (w->title[0])
+            snprintf(text, sizeof(text), "%d. %s - %.30s", i + 1, w->owner, w->title);
+        else
+            snprintf(text, sizeof(text), "%d. %s", i + 1, w->owner);
+
+        char data[16];
+        snprintf(data, sizeof(data), "win:%d", i + 1);
+        kb_add_button(row, text, data);
+        cJSON_AddItemToArray(kb, row);
+    }
+
+    return kb_to_json(kb);
+}
+
+/* ============================================================================
+ * Bot Command Handlers
+ * ========================================================================= */
+
 /* Build the .list response. */
 sds build_list_message(void) {
     refresh_window_list();
@@ -761,19 +847,21 @@ sds build_help_message(void) {
 
 #define SCREENSHOT_PATH "/tmp/tgterm_screenshot.png"
 #define OWNER_KEY "owner_id"
-#define REFRESH_BTN "🔄 Refresh"
-#define REFRESH_DATA "refresh"
 
-/* Send screenshot with refresh button. */
+/* Send screenshot with connected-state keyboard. */
 void send_screenshot(int64_t chat_id) {
     if (capture_connected_window(SCREENSHOT_PATH) != 0) return;
-    botSendImageWithKeyboard(chat_id, SCREENSHOT_PATH, REFRESH_BTN, REFRESH_DATA, NULL);
+    sds kb = build_connected_keyboard();
+    botSendImageWithKeyboard(chat_id, SCREENSHOT_PATH, kb, NULL);
+    sdsfree(kb);
 }
 
 /* Refresh an existing screenshot message by editing its media. */
 void refresh_screenshot(int64_t chat_id, int64_t msg_id) {
     if (capture_connected_window(SCREENSHOT_PATH) != 0) return;
-    botEditMessageMedia(chat_id, msg_id, SCREENSHOT_PATH, REFRESH_BTN, REFRESH_DATA);
+    sds kb = build_connected_keyboard();
+    botEditMessageMedia(chat_id, msg_id, SCREENSHOT_PATH, kb);
+    sdsfree(kb);
 }
 
 void handle_request(sqlite3 *db, BotRequest *br) {
@@ -830,10 +918,125 @@ void handle_request(sqlite3 *db, BotRequest *br) {
 
     /* Handle callback query (button press). */
     if (br->is_callback) {
-        botAnswerCallbackQuery(br->callback_id);
-        if (strcmp(br->callback_data, REFRESH_DATA) == 0 && Connected) {
-            refresh_screenshot(br->target, br->msg_id);
+        const char *data = br->callback_data;
+
+        /* Modifier toggle buttons. */
+        if (strcmp(data, "ctrl") == 0 || strcmp(data, "alt") == 0 ||
+            strcmp(data, "cmd") == 0) {
+            int mod = 0;
+            if (data[1] == 't') mod = MOD_CTRL;       /* "ctrl" */
+            else if (data[0] == 'a') mod = MOD_ALT;   /* "alt" */
+            else mod = MOD_CMD;                        /* "cmd" */
+            ArmedMods ^= mod;
+            botAnswerCallbackQuery(br->callback_id);
+            sds kb = build_connected_keyboard();
+            botEditMessageReplyMarkup(br->target, br->msg_id, kb);
+            sdsfree(kb);
+            goto done;
         }
+
+        /* ESC button. */
+        if (strcmp(data, "esc") == 0 && Connected) {
+            botAnswerCallbackQuery(br->callback_id);
+            raise_window_by_id(ConnectedPid, ConnectedWid);
+            send_key(ConnectedPid, kVK_Escape, 0, 0);
+            ArmedMods = 0;
+            sleep(1);
+            connected_window_exists();
+            refresh_screenshot(br->target, br->msg_id);
+            goto done;
+        }
+
+        /* Enter button. */
+        if (strcmp(data, "enter") == 0 && Connected) {
+            botAnswerCallbackQuery(br->callback_id);
+            raise_window_by_id(ConnectedPid, ConnectedWid);
+            send_key(ConnectedPid, kVK_Return, 0, ArmedMods);
+            ArmedMods = 0;
+            sleep(1);
+            connected_window_exists();
+            refresh_screenshot(br->target, br->msg_id);
+            goto done;
+        }
+
+        /* Scroll buttons: Shift+PageUp/Down for scrollback, Shift+End for bottom. */
+        if (strcmp(data, "scrollup") == 0 && Connected) {
+            botAnswerCallbackQuery(br->callback_id);
+            raise_window_by_id(ConnectedPid, ConnectedWid);
+            send_key(ConnectedPid, kVK_PageUp, 0, MOD_SHIFT);
+            usleep(300000);
+            refresh_screenshot(br->target, br->msg_id);
+            goto done;
+        }
+        if (strcmp(data, "scrolldn") == 0 && Connected) {
+            botAnswerCallbackQuery(br->callback_id);
+            raise_window_by_id(ConnectedPid, ConnectedWid);
+            send_key(ConnectedPid, kVK_PageDown, 0, MOD_SHIFT);
+            usleep(300000);
+            refresh_screenshot(br->target, br->msg_id);
+            goto done;
+        }
+        if (strcmp(data, "scrollbot") == 0 && Connected) {
+            botAnswerCallbackQuery(br->callback_id);
+            raise_window_by_id(ConnectedPid, ConnectedWid);
+            send_key(ConnectedPid, kVK_End, 0, MOD_SHIFT);
+            usleep(300000);
+            refresh_screenshot(br->target, br->msg_id);
+            goto done;
+        }
+
+        /* Refresh button. */
+        if (strcmp(data, "refresh") == 0 && Connected) {
+            botAnswerCallbackQuery(br->callback_id);
+            refresh_screenshot(br->target, br->msg_id);
+            goto done;
+        }
+
+        /* List button. */
+        if (strcmp(data, "list") == 0) {
+            botAnswerCallbackQuery(br->callback_id);
+            disconnect();
+            ArmedMods = 0;
+            sds msg = build_list_message();
+            sds kb = build_window_list_keyboard();
+            if (kb) {
+                botSendMessageWithKeyboard(br->target, msg, kb);
+                sdsfree(kb);
+            } else {
+                botSendMessage(br->target, msg, 0);
+            }
+            sdsfree(msg);
+            goto done;
+        }
+
+        /* Window selection button. */
+        if (strncmp(data, "win:", 4) == 0) {
+            botAnswerCallbackQuery(br->callback_id);
+            int n = atoi(data + 4);
+            refresh_window_list();
+
+            if (n < 1 || n > WindowCount) {
+                botSendMessage(br->target, "Window not available.", 0);
+                goto done;
+            }
+
+            WinInfo *w = &WindowList[n - 1];
+            Connected = 1;
+            ConnectedWid = w->window_id;
+            ConnectedPid = w->pid;
+            strncpy(ConnectedOwner, w->owner, sizeof(ConnectedOwner) - 1);
+            ConnectedOwner[sizeof(ConnectedOwner) - 1] = '\0';
+            strncpy(ConnectedTitle, w->title, sizeof(ConnectedTitle) - 1);
+            ConnectedTitle[sizeof(ConnectedTitle) - 1] = '\0';
+            ArmedMods = 0;
+
+            raise_window_by_id(w->pid, w->window_id);
+            send_screenshot(br->target);
+            goto done;
+        }
+
+        /* Unknown callback. */
+        botAnswerCallbackQuery(br->callback_id);
         goto done;
     }
 
@@ -842,8 +1045,15 @@ void handle_request(sqlite3 *db, BotRequest *br) {
     /* Handle .list command. */
     if (strcasecmp(req, ".list") == 0) {
         disconnect();
+        ArmedMods = 0;
         sds msg = build_list_message();
-        botSendMessage(br->target, msg, 0);
+        sds kb = build_window_list_keyboard();
+        if (kb) {
+            botSendMessageWithKeyboard(br->target, msg, kb);
+            sdsfree(kb);
+        } else {
+            botSendMessage(br->target, msg, 0);
+        }
         sdsfree(msg);
         goto done;
     }
@@ -892,6 +1102,7 @@ void handle_request(sqlite3 *db, BotRequest *br) {
         ConnectedOwner[sizeof(ConnectedOwner) - 1] = '\0';
         strncpy(ConnectedTitle, w->title, sizeof(ConnectedTitle) - 1);
         ConnectedTitle[sizeof(ConnectedTitle) - 1] = '\0';
+        ArmedMods = 0;
 
         sds msg = sdsnew("Connected to ");
         msg = sdscat(msg, ConnectedOwner);
@@ -911,7 +1122,13 @@ void handle_request(sqlite3 *db, BotRequest *br) {
     /* Not a command - send as keystrokes if connected. */
     if (!Connected) {
         sds msg = build_list_message();
-        botSendMessage(br->target, msg, 0);
+        sds kb = build_window_list_keyboard();
+        if (kb) {
+            botSendMessageWithKeyboard(br->target, msg, kb);
+            sdsfree(kb);
+        } else {
+            botSendMessage(br->target, msg, 0);
+        }
         sdsfree(msg);
         goto done;
     }
@@ -919,12 +1136,46 @@ void handle_request(sqlite3 *db, BotRequest *br) {
     /* Check window still exists. */
     if (!connected_window_exists()) {
         disconnect();
+        ArmedMods = 0;
         sds msg = sdsnew("Window closed.\n\n");
         sds list = build_list_message();
         msg = sdscatsds(msg, list);
         sdsfree(list);
-        botSendMessage(br->target, msg, 0);
+        sds kb = build_window_list_keyboard();
+        if (kb) {
+            botSendMessageWithKeyboard(br->target, msg, kb);
+            sdsfree(kb);
+        } else {
+            botSendMessage(br->target, msg, 0);
+        }
         sdsfree(msg);
+        goto done;
+    }
+
+    /* Apply armed modifiers to keystrokes. */
+    if (ArmedMods) {
+        int saved = ArmedMods;
+        ArmedMods = 0;
+
+        /* For short text (1-2 chars), apply modifiers to all chars.
+         * For longer text, apply only to the first char. */
+        raise_window_by_id(ConnectedPid, ConnectedWid);
+
+        size_t tlen = strlen(req);
+        if (tlen <= 2 && !ends_with_purple_heart(req)) {
+            /* Send each char with modifiers. */
+            for (size_t i = 0; i < tlen; i++)
+                send_key(ConnectedPid, 0, (UniChar)req[i], saved);
+        } else {
+            /* Send first char with modifiers, rest normally. */
+            send_key(ConnectedPid, 0, (UniChar)req[0], saved);
+            if (tlen > 1)
+                send_keys(req + 1);
+        }
+
+        sleep(2);
+        connected_window_exists();
+        send_screenshot(br->target);
         goto done;
     }
 

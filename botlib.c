@@ -394,9 +394,10 @@ int botSendImage(int64_t target, char *filename) {
     return retval;
 }
 
-/* Send an image with an inline keyboard button. Returns message_id via msg_id
+/* Send an image with an inline keyboard. reply_markup is the JSON string
+ * for the keyboard (or NULL for no keyboard). Returns message_id via msg_id
  * if not NULL. Return 1 on success, 0 on error. */
-int botSendImageWithKeyboard(int64_t target, char *filename, const char *btn_text, const char *btn_data, int64_t *msg_id) {
+int botSendImageWithKeyboard(int64_t target, char *filename, const char *reply_markup, int64_t *msg_id) {
     CURL *curl;
     CURLcode res;
     int retval = 0;
@@ -416,15 +417,13 @@ int botSendImageWithKeyboard(int64_t target, char *filename, const char *btn_tex
                  CURLFORM_FILE, filename,
                  CURLFORM_END);
 
-    /* Build inline keyboard JSON. */
-    sds keyboard = sdscatprintf(sdsempty(),
-        "{\"inline_keyboard\":[[{\"text\":\"%s\",\"callback_data\":\"%s\"}]]}",
-        btn_text, btn_data);
-    curl_formadd(&formpost, &lastptr,
-                 CURLFORM_COPYNAME, "reply_markup",
-                 CURLFORM_COPYCONTENTS, keyboard,
-                 CURLFORM_END);
-    sdsfree(keyboard);
+    /* Inline keyboard. */
+    if (reply_markup) {
+        curl_formadd(&formpost, &lastptr,
+                     CURLFORM_COPYNAME, "reply_markup",
+                     CURLFORM_COPYCONTENTS, reply_markup,
+                     CURLFORM_END);
+    }
 
     curl = curl_easy_init();
     if (curl) {
@@ -469,8 +468,9 @@ int botSendImageWithKeyboard(int64_t target, char *filename, const char *btn_tex
     return retval;
 }
 
-/* Edit a message to replace its media with a new image. */
-int botEditMessageMedia(int64_t chat_id, int64_t message_id, char *filename, const char *btn_text, const char *btn_data) {
+/* Edit a message to replace its media with a new image. reply_markup is the
+ * JSON string for the keyboard (or NULL to keep existing). */
+int botEditMessageMedia(int64_t chat_id, int64_t message_id, char *filename, const char *reply_markup) {
     CURL *curl;
     CURLcode res;
     int retval = 0;
@@ -504,15 +504,11 @@ int botEditMessageMedia(int64_t chat_id, int64_t message_id, char *filename, con
                  CURLFORM_END);
 
     /* Inline keyboard. */
-    if (btn_text && btn_data) {
-        sds keyboard = sdscatprintf(sdsempty(),
-            "{\"inline_keyboard\":[[{\"text\":\"%s\",\"callback_data\":\"%s\"}]]}",
-            btn_text, btn_data);
+    if (reply_markup) {
         curl_formadd(&formpost, &lastptr,
                      CURLFORM_COPYNAME, "reply_markup",
-                     CURLFORM_COPYCONTENTS, keyboard,
+                     CURLFORM_COPYCONTENTS, reply_markup,
                      CURLFORM_END);
-        sdsfree(keyboard);
     }
 
     curl = curl_easy_init();
@@ -541,7 +537,7 @@ int botEditMessageMedia(int64_t chat_id, int64_t message_id, char *filename, con
             retval = 0;
         }
 
-        if (retval == 0)
+        if (retval == 0 && !strstr(body, "message is not modified"))
             printf("editMessageMedia() error: %s\n", body);
         sdsfree(body);
         curl_easy_cleanup(curl);
@@ -559,6 +555,56 @@ int botAnswerCallbackQuery(const char *callback_id) {
     int res;
     sds body = makeGETBotRequest("answerCallbackQuery", &res, options, 1);
     sdsfree(body);
+    return res;
+}
+
+/* Send a text message with an inline keyboard. reply_markup is the JSON
+ * string for the keyboard (or NULL for no keyboard).
+ * Return 1 on success, 0 on error. */
+int botSendMessageWithKeyboard(int64_t target, sds text, const char *reply_markup) {
+    char *options[10];
+    int optlen = 4;
+    options[0] = "chat_id";
+    options[1] = sdsfromlonglong(target);
+    options[2] = "text";
+    options[3] = text;
+    options[4] = "parse_mode";
+    options[5] = "Markdown";
+    options[6] = "disable_web_page_preview";
+    options[7] = "true";
+    if (reply_markup) {
+        options[8] = "reply_markup";
+        options[9] = (char *)reply_markup;
+        optlen = 5;
+    }
+
+    int res;
+    sds body = makeGETBotRequest("sendMessage", &res, options, optlen);
+    sdsfree(body);
+    sdsfree(options[1]);
+    return res;
+}
+
+/* Edit the reply markup (inline keyboard) of an existing message.
+ * Return 1 on success, 0 on error. */
+int botEditMessageReplyMarkup(int64_t chat_id, int64_t message_id, const char *reply_markup) {
+    char *options[6];
+    int optlen = 2;
+    options[0] = "chat_id";
+    options[1] = sdsfromlonglong(chat_id);
+    options[2] = "message_id";
+    options[3] = sdsfromlonglong(message_id);
+    if (reply_markup) {
+        options[4] = "reply_markup";
+        options[5] = (char *)reply_markup;
+        optlen = 3;
+    }
+
+    int res;
+    sds body = makeGETBotRequest("editMessageReplyMarkup", &res, options, optlen);
+    sdsfree(body);
+    sdsfree(options[1]);
+    sdsfree(options[3]);
     return res;
 }
 
